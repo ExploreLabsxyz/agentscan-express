@@ -22,4 +22,5 @@ router.get("/health", (req, res) => {
   res.status(200).json({ message: "API is running" });
 });
 router.use("/instance", require("./instance").default);
+router.use("/chats", authMiddleware, require("./chats").default);
 export default router;
