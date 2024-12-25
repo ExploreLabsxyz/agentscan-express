@@ -484,7 +484,7 @@ Link: ${tx.transactionLink}`;
     .join("\n");
 
   return {
-    role: "system",
+    role: "user",
     content:
       promptTemplates[promptType] +
       `\n\nCONTEXT:
@@ -555,16 +555,19 @@ export async function* generateChatResponseWithRetry(
     transactions
   );
 
+
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "o1-preview",
       messages: [systemPrompt, ...messages],
-      temperature: 0.7,
-      max_tokens: 1250,
+      // temperature: 0.7,
       stream: true,
     });
 
+
     for await (const chunk of response as any) {
+
+      console.log("chunk.choices[0]", chunk.choices[0]);
       const content = chunk.choices[0]?.delta?.content;
       if (content) {
         yield content;
