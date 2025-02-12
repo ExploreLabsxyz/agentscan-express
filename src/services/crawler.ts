@@ -1009,7 +1009,8 @@ async function handleGitHubRateLimit(error: any): Promise<void> {
 // Update GitHub repository processing function
 async function processGithubRepo(
   repoUrl: string,
-  organization_id: string
+  organization_id: string,
+  contextType: string | null = null
 ): Promise<boolean> {
   try {
     const urlId = crypto.createHash("sha256").update(repoUrl).digest("hex");
@@ -1121,7 +1122,9 @@ async function processGithubRepo(
               return await processDocument(
                 fileUrl,
                 filteredContent || pdfText,
-                organization_id
+                organization_id,
+                undefined,
+                contextType
               );
             } catch (pdfError) {
               console.error(

@@ -65,7 +65,7 @@ const STAKING_PATTERNS = [
   "set up my own",
 ].map((pattern) => `%${pattern}%`);
 
-export type PromptType = "general" | "agent";
+export type PromptType = "general" | "agent" | "code";
 
 const TEAM_CACHE_TTL = 30 * 60;
 
@@ -169,6 +169,12 @@ export async function findRelevantContext(
       agentId,
       transactions
     );
+  } else if (promptType === "code") {
+    codeEmbeddings = await fetchCodeEmbeddingsCode(
+      questionEmbedding,
+      teamName,
+      decodedQuestion
+    );
   } else {
     codeEmbeddings = await fetchCodeEmbeddingsGeneral(
       questionEmbedding,
@@ -183,10 +189,9 @@ export async function findRelevantContext(
     decodedQuestion,
     surroundingMessages
   );
+  //look for yaml content
 
-  const result = filterAndSortContext(codeEmbeddings, relevantEmbeddings);
-
-  // Cache the result...
+  const result = await filterAndSortContext(codeEmbeddings, relevantEmbeddings);
   if (deploymentId !== "local") {
     try {
       await redis.set(cacheKey, JSON.stringify(result), {
@@ -221,6 +226,7 @@ async function fetchCodeEmbeddingsGeneral(
         (embedding <=> $1) as similarity
       FROM context_embeddings 
       WHERE company_id = $2 
+      AND type = 'adev'
       AND (embedding <=> $1) < 0.8
       ORDER BY similarity
     )
@@ -279,10 +285,10 @@ async function fetchCodeEmbeddingsAgent(
         SELECT id, content, name, location, type, original_location, (embedding <=> $1) as similarity
         FROM context_embeddings 
         WHERE company_id = $2 
+        AND type = 'adev'
         AND (
-          (type = 'component' AND LOWER(id) LIKE $4)
-          OR (type = 'abi' AND LOWER(name) LIKE ANY($5::text[]))
-          OR (type != 'component' AND type != 'abi')
+          (LOWER(id) LIKE $4)
+          OR (LOWER(name) LIKE ANY($5::text[]))
         )
         ORDER BY similarity
       )
@@ -325,6 +331,7 @@ async function fetchCodeEmbeddingsBasic(
       SELECT content, name, location, type, original_location, (embedding <=> $1) as similarity
       FROM context_embeddings 
       WHERE company_id = $2 
+      AND type = 'adev'
       AND (embedding <=> $1) < 0.8
       ORDER BY similarity
     )
@@ -343,6 +350,129 @@ async function fetchCodeEmbeddingsBasic(
   return query.rows.slice(0, 15);
 }
 
+async function fetchCodeEmbeddingsCode(
+  questionEmbedding: any,
+  teamName: string,
+  decodedQuestion: string
+) {
+  const deploymentId = process.env.RAILWAY_DEPLOYMENT_ID || "local";
+  const cacheKey = `adev_commands:${teamName}`;
+
+  try {
+    const cachedCommands = await redis.get(cacheKey);
+    if (cachedCommands && deploymentId !== "local") {
+      const parsed = JSON.parse(cachedCommands);
+      if (parsed && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch (error) {
+    console.error("Cache error in fetchCodeEmbeddingsCode:", error);
+  }
+
+  const criticalDocsQuery = await pool.query(
+    `WITH all_commands AS (
+      SELECT 
+        content, 
+        name,
+        location,
+        original_location,
+        type,
+        0 as similarity,
+        TRUE as is_critical
+      FROM context_embeddings 
+      WHERE company_id = $2 
+      AND type = 'adev'
+      AND location ILIKE '%https://8ball030.github.io/auto_dev/commands%'
+    ),
+    critical_docs AS (
+      SELECT 
+        content, 
+        name,
+        location,
+        original_location,
+        type,
+        (embedding <=> $1) as similarity,
+        TRUE as is_critical
+      FROM context_embeddings 
+      WHERE company_id = $2 
+      AND type = 'adev'
+      AND (
+        original_location = 'https://github.com/8ball030/auto_dev/blob/main/README.md'
+        OR location ILIKE '%create_new_agent_from_fsm.yaml%'
+      )
+      ORDER BY CASE 
+        WHEN location LIKE '%#chunk%' 
+        THEN CAST(SUBSTRING(location FROM '#chunk([0-9]+)' FOR '#') AS INTEGER)
+        ELSE 999999
+      END
+    )
+    SELECT * FROM all_commands UNION ALL SELECT * FROM critical_docs`,
+    [questionEmbedding, teamName]
+  );
+
+  const adevQuery = await pool.query(
+    `WITH ranked_matches AS (
+      SELECT 
+        content, 
+        name,
+        location,
+        original_location,
+        type,
+        (embedding <=> $1) as similarity,
+        FALSE as is_critical
+      FROM context_embeddings 
+      WHERE company_id = $2 
+      AND type = 'adev'
+      AND original_location NOT IN (
+        'https://github.com/8ball030/auto_dev/blob/main//README.md',
+        'https://github.com/8ball030/auto_dev/blob/main/auto_dev/data/workflows/create_new_agent_from_fsm.yaml'
+      )
+      AND location NOT ILIKE '%/commands%'
+      AND (embedding <=> $1) < 0.8
+      ORDER BY similarity
+      LIMIT 10
+    )
+    SELECT *,
+      CASE 
+        WHEN LOWER(content) LIKE $3 THEN similarity * 0.7
+        WHEN LOWER(name) LIKE $3 THEN similarity * 0.8
+        ELSE similarity
+      END as adjusted_similarity,
+      FALSE as is_critical
+    FROM ranked_matches
+    ORDER BY adjusted_similarity`,
+    [questionEmbedding, teamName, `%${decodedQuestion.toLowerCase()}%`]
+  );
+
+  const combinedDocs = [...criticalDocsQuery.rows, ...adevQuery.rows];
+  console.log("combinedDocs", combinedDocs.length);
+  // Only cache if we have results
+  if (combinedDocs.length > 0 && deploymentId !== "local") {
+    try {
+      await redis.set(cacheKey, JSON.stringify(combinedDocs), {
+        EX: 24 * 60 * 60,
+      });
+    } catch (error) {
+      console.error("Error caching docs:", error);
+    }
+  }
+
+  //check if https://github.com/8ball030/auto_dev/blob/main/auto_dev/data/workflows/create_new_agent_from_fsm.yaml is in the critical docs
+  const isWorkflowInCriticalDocs = combinedDocs.find(
+    (row) =>
+      row.location ===
+      "https://github.com/8ball030/auto_dev/blob/main/auto_dev/data/workflows/create_new_agent_from_fsm.yaml"
+  );
+  if (isWorkflowInCriticalDocs) {
+    console.log("Workflow found in critical docs", isWorkflowInCriticalDocs);
+  } else {
+    console.log("Workflow not found in critical docs");
+  }
+
+  return combinedDocs;
+}
+
 async function scoreEmbeddings(
   codeEmbeddings: any[],
   decodedQuestion: string,
@@ -355,6 +485,16 @@ async function scoreEmbeddings(
   const BATCH_SIZE = 5;
   const results: Array<{ score: number; index: number }> = [];
 
+  // First, add critical documents with max score
+  codeEmbeddings.forEach((embedding, index) => {
+    if (embedding.is_critical) {
+      results.push({ score: 10, index });
+    }
+  });
+
+  // Then score non-critical documents
+  const nonCriticalEmbeddings = codeEmbeddings.filter((e) => !e.is_critical);
+
   const conversationContext = surroundingMessages
     ? "\n\nConversation Context:\n" +
       surroundingMessages
@@ -365,8 +505,8 @@ async function scoreEmbeddings(
         .join("\n")
     : "";
 
-  for (let i = 0; i < codeEmbeddings.length; i += BATCH_SIZE) {
-    const batch = codeEmbeddings.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < nonCriticalEmbeddings.length; i += BATCH_SIZE) {
+    const batch = nonCriticalEmbeddings.slice(i, i + BATCH_SIZE);
 
     await withRetry(
       async () => {
@@ -408,9 +548,12 @@ async function scoreEmbeddings(
         }
 
         scores.forEach((score, batchIndex) => {
+          const originalIndex = codeEmbeddings.findIndex(
+            (e) => e === batch[batchIndex]
+          );
           results.push({
             score,
-            index: i + batchIndex,
+            index: originalIndex,
           });
         });
       },
@@ -421,38 +564,121 @@ async function scoreEmbeddings(
   return results;
 }
 
-function filterAndSortContext(
+async function filterAndSortContext(
   codeEmbeddings: any[],
   relevantEmbeddings: Array<{ score: number; index: number }>
-): RelevantContext[] {
-  const minResults = 6;
-  const percentageToKeep = 0.35;
+): Promise<RelevantContext[]> {
+  // Separate critical and non-critical embeddings
+  const criticalEmbeddings = codeEmbeddings.filter((e) => e.is_critical);
+  const nonCriticalIndices = codeEmbeddings
+    .map((e, i) => ({ embedding: e, index: i }))
+    .filter((e) => !e.embedding.is_critical)
+    .map((e) => e.index);
 
-  const sortedEmbeddings = relevantEmbeddings.sort((a, b) => b.score - a.score);
-  const numToKeep = Math.max(
-    minResults,
-    Math.ceil(sortedEmbeddings.length * percentageToKeep)
-  );
+  // Sort and filter non-critical embeddings
+  const sortedNonCriticalEmbeddings = relevantEmbeddings
+    .filter(({ index }) => nonCriticalIndices.includes(index))
+    .sort((a, b) => b.score - a.score);
 
-  const relevantIndices = sortedEmbeddings
-    .slice(0, numToKeep)
+  const relevantNonCriticalIndices = sortedNonCriticalEmbeddings
+    .slice(0, 5) // Take exactly 5 non-critical items
     .filter(({ score }) => score >= 4)
     .map(({ index }) => index);
 
-  const relevantContext = codeEmbeddings
-    .filter((_, index) => relevantIndices.includes(index))
-    .map((embedding) => ({
+  // Combine critical and filtered non-critical embeddings
+  let relevantContext = [
+    ...criticalEmbeddings.map((embedding) => ({
       content: embedding.content,
       name: embedding.name,
       location: embedding.location || "",
       type: embedding.type || "component",
-      score:
-        relevantEmbeddings.find(({ index }) => index === index)?.score || 0,
-    }));
+      score: 10, // Critical embeddings get max score
+    })),
+    ...codeEmbeddings
+      .filter((_, index) => relevantNonCriticalIndices.includes(index))
+      .map((embedding) => ({
+        content: embedding.content,
+        name: embedding.name,
+        location: embedding.location || "",
+        type: embedding.type || "component",
+        score:
+          relevantEmbeddings.find(({ index }) => index === index)?.score || 0,
+      })),
+  ];
+
+  // Check if any of the relevant context items are chunks
+  const hasChunks = relevantContext.some((ctx) =>
+    ctx.location.includes("#chunk")
+  );
+
+  // If chunks are found, fetch all chunks from the same document
+  if (hasChunks) {
+    const query = await pool.query(
+      `WITH chunk_docs AS (
+        SELECT DISTINCT original_location 
+        FROM context_embeddings 
+        WHERE location LIKE '%#chunk%'
+        AND original_location IN (
+          SELECT original_location 
+          FROM context_embeddings 
+          WHERE location = ANY($1)
+        )
+      )
+      SELECT 
+        content,
+        name,
+        location,
+        type,
+        original_location
+      FROM context_embeddings 
+      WHERE original_location IN (SELECT original_location FROM chunk_docs)
+      ORDER BY 
+        original_location,
+        CASE 
+          WHEN location LIKE '%#chunk%' 
+          THEN CAST(SUBSTRING(location FROM '#chunk([0-9]+)' FOR '#') AS INTEGER)
+          ELSE 999999
+        END`,
+      [relevantContext.map((ctx) => ctx.location)]
+    );
+
+    // Group chunks by original_location
+    const chunksByDoc = query.rows.reduce((acc: any, row) => {
+      if (!acc[row.original_location]) {
+        acc[row.original_location] = [];
+      }
+      acc[row.original_location].push(row);
+      return acc;
+    }, {});
+
+    // Replace individual chunks with complete documents
+    relevantContext = relevantContext.map((ctx) => {
+      if (ctx.location.includes("#chunk")) {
+        const originalLocation = ctx.location.split("#")[0];
+        const chunks = chunksByDoc[originalLocation];
+        if (chunks) {
+          return {
+            content: chunks.map((c: any) => c.content).join("\n\n"),
+            name: chunks[0].name,
+            location: originalLocation,
+            type: chunks[0].type,
+            score: ctx.score,
+          };
+        }
+      }
+      return ctx;
+    });
+
+    // Remove duplicates
+    relevantContext = relevantContext.filter(
+      (ctx, index, self) =>
+        index === self.findIndex((t) => t.location === ctx.location)
+    );
+  }
 
   return relevantContext
     .sort((a: any, b: any) => b.similarity - a.similarity)
-    .slice(0, 10);
+    .slice(0, criticalEmbeddings.length + 5); // Return critical context plus exactly 5 non-critical items
 }
 
 export async function* generateConversationResponse(
@@ -465,7 +691,7 @@ export async function* generateConversationResponse(
 ): AsyncGenerator<ChatResponse> {
   try {
     const decodedQuestion = decodeURIComponent(question);
-    const { system_prompt_name, name: teamName } = teamData;
+    let { system_prompt_name, name: teamName } = teamData;
     const deploymentId = process.env.RAILWAY_DEPLOYMENT_ID || "local";
     const cacheKey = `conversation:${deploymentId}:${
       teamData.id
@@ -519,7 +745,7 @@ export async function* generateConversationResponse(
         limitedContext,
         messages,
         system_prompt_name,
-        promptType,
+        promptType as any,
         agent
           ? {
               name: agent.agent.originalName,
@@ -544,7 +770,7 @@ export async function* generateConversationResponse(
       // Cache the response
       try {
         await redis.set(cacheKey, JSON.stringify(responseChunks), {
-          EX: CACHE_TTL,
+          EX: CODE_CACHE_TTL,
         });
       } catch (cacheError) {
         console.error("Error caching response:", cacheError);
@@ -565,4 +791,4 @@ export async function* generateConversationResponse(
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Add cache TTL constant
-const CACHE_TTL = 3 * 60 * 60; // 3 hours
+const CODE_CACHE_TTL = 2 * 24 * 60 * 60; // 2 days in seconds
