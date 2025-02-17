@@ -17,6 +17,16 @@ import { YoutubeTranscript } from "youtube-transcript";
 import { google } from "googleapis";
 import { JSDOM } from "jsdom";
 
+// Add at the top of the file, after imports
+const PERFORMANCE_CONFIG = {
+  BROWSER_POOL_SIZE: 5, // Number of browser instances to keep in pool
+  PAGE_TIMEOUT: 30000, // 30 seconds page timeout
+  CONCURRENT_SCRAPES: 8, // Number of concurrent page scrapes
+  CACHE_TTL: 3600000, // 1 hour cache TTL in ms
+  RATE_LIMIT_WINDOW: 60000, // 1 minute window in ms
+  RATE_LIMIT_MAX_REQUESTS: 60, // Max requests per window
+};
+
 // Simplify the status enum
 enum ProcessingStatus {
   PENDING = "pending",
@@ -609,7 +619,24 @@ async function _website(
   url: string,
   organization_id: string
 ): Promise<dContent> {
-  let browser: any = null;
+  // Check cache first
+  const cacheKey = `${url}:${organization_id}`;
+  const cached = getCachedData<dContent>(cacheKey);
+  if (cached) {
+    console.log(`Cache hit for ${url}`);
+    return cached;
+  }
+
+  // Check rate limit
+  const rateLimitKey = new URL(url).hostname;
+  if (!checkRateLimit(rateLimitKey)) {
+    console.log(`Rate limit exceeded for ${rateLimitKey}`);
+    await new Promise((resolve) =>
+      setTimeout(resolve, PERFORMANCE_CONFIG.RATE_LIMIT_WINDOW)
+    );
+  }
+
+  let browser: Browser | null = null;
   let context: any = null;
   let page: any = null;
 
@@ -659,17 +686,12 @@ async function _website(
       async () => {
         try {
           console.log(`Starting  for ${url}`);
-          // Launch a new browser instance for each
-          browser = await chromium.launch({
-            headless: true,
-            args: [
-              "--no-sandbox",
-              "--disable-setuid-sandbox",
-              "--disable-dev-shm-usage",
-              "--disable-gpu",
-              "--single-process",
-            ],
-          });
+
+          // Get browser from pool
+          browser = await acquireBrowser();
+          if (!browser) {
+            browser = await chromium.launch(BROWSER_LAUNCH_OPTIONS);
+          }
 
           context = await browser.newContext({
             userAgent:
@@ -678,13 +700,15 @@ async function _website(
 
           page = await context.newPage();
 
-          await page.setDefaultTimeout(TIMEOUTS.PAGE_LOAD);
-          await page.setDefaultNavigationTimeout(TIMEOUTS.PAGE_LOAD);
+          await page.setDefaultTimeout(PERFORMANCE_CONFIG.PAGE_TIMEOUT);
+          await page.setDefaultNavigationTimeout(
+            PERFORMANCE_CONFIG.PAGE_TIMEOUT
+          );
 
           console.log(`Navigating to ${url}`);
           await page.goto(url, {
             waitUntil: "networkidle",
-            timeout: TIMEOUTS.PAGE_LOAD,
+            timeout: PERFORMANCE_CONFIG.PAGE_TIMEOUT,
           });
 
           const content = (await Promise.race([
@@ -716,12 +740,21 @@ async function _website(
                 !processedUrlsCache.has(link)
             );
 
+          // Cache the result
+          setCachedData(cacheKey, content);
+
           return content;
         } finally {
-          // Ensure proper cleanup of resources
+          // Cleanup resources
           if (page) await page.close().catch(console.error);
           if (context) await context.close().catch(console.error);
-          if (browser) await browser.close().catch(console.error);
+          if (browser) {
+            if (browserPool.includes(browser)) {
+              releaseBrowser(browser);
+            } else {
+              await browser.close().catch(console.error);
+            }
+          }
         }
       },
       {
@@ -735,7 +768,13 @@ async function _website(
     try {
       if (page) await page.close().catch(console.error);
       if (context) await context.close().catch(console.error);
-      if (browser) await browser.close().catch(console.error);
+      if (browser) {
+        if (browserPool.includes(browser)) {
+          releaseBrowser(browser);
+        } else {
+          await (browser as Browser).close().catch(console.error);
+        }
+      }
     } catch (cleanupError) {
       console.error("Error during cleanup:", cleanupError);
     }
@@ -743,16 +782,137 @@ async function _website(
   }
 }
 
-// Add cleanup function for the browser instance
-export async function cleanupBrowser(): Promise<void> {
-  if (browserInstance) {
-    try {
-      await browserInstance.close();
-    } catch (error) {
-      console.error("Error closing browser:", error);
-    } finally {
-      browserInstance = null;
+// Add browser pool management
+let browserPool: Browser[] = [];
+const availableBrowsers = new Set<Browser>();
+const browserPoolLock = new Map<Browser, boolean>();
+
+// Add cache types
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+  ttl: number;
+}
+
+// Add rate limit types
+interface RateLimit {
+  count: number;
+  resetTime: number;
+}
+
+// Add in-memory cache with TTL
+const cache = new Map<string, CacheEntry<any>>();
+
+// Add rate limiting
+const rateLimitMap = new Map<string, RateLimit>();
+
+// Add browser pool management
+async function initBrowserPool() {
+  try {
+    for (let i = 0; i < PERFORMANCE_CONFIG.BROWSER_POOL_SIZE; i++) {
+      const browser = await chromium.launch(BROWSER_LAUNCH_OPTIONS);
+      browserPool.push(browser);
+      availableBrowsers.add(browser);
+      browserPoolLock.set(browser, false);
     }
+    console.log(
+      `Initialized browser pool with ${browserPool.length} instances`
+    );
+  } catch (error) {
+    console.error("Failed to initialize browser pool:", error);
+    throw error;
+  }
+}
+
+// Add browser acquisition with timeout
+async function acquireBrowser(timeout: number = 5000): Promise<Browser | null> {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeout) {
+    for (const browser of availableBrowsers) {
+      if (!browserPoolLock.get(browser)) {
+        availableBrowsers.delete(browser);
+        browserPoolLock.set(browser, true);
+        return browser;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return null;
+}
+
+// Add browser release function
+function releaseBrowser(browser: Browser) {
+  if (browserPool.includes(browser)) {
+    browserPoolLock.set(browser, false);
+    availableBrowsers.add(browser);
+  }
+}
+
+// Add cache management
+function getCachedData<T>(key: string): T | null {
+  const cached = cache.get(key);
+  if (cached) {
+    if (Date.now() - cached.timestamp < cached.ttl) {
+      return cached.data as T;
+    }
+    cache.delete(key);
+  }
+  return null;
+}
+
+function setCachedData<T>(
+  key: string,
+  data: T,
+  ttl: number = PERFORMANCE_CONFIG.CACHE_TTL
+) {
+  cache.set(key, {
+    data,
+    timestamp: Date.now(),
+    ttl,
+  });
+}
+
+// Add rate limiting
+function checkRateLimit(key: string): boolean {
+  const now = Date.now();
+  const limit = rateLimitMap.get(key);
+
+  if (!limit || now > limit.resetTime) {
+    rateLimitMap.set(key, {
+      count: 1,
+      resetTime: now + PERFORMANCE_CONFIG.RATE_LIMIT_WINDOW,
+    });
+    return true;
+  }
+
+  if (limit.count >= PERFORMANCE_CONFIG.RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+
+  limit.count++;
+  return true;
+}
+
+// Initialize browser pool on module load
+initBrowserPool().catch(console.error);
+
+// Update the cleanup function with proper typing
+export async function cleanupBrowserPool(): Promise<void> {
+  try {
+    const closePromises = browserPool.map(async (browser: Browser) => {
+      try {
+        await browser.close();
+      } catch (error) {
+        console.error("Error closing browser:", error);
+      }
+    });
+
+    await Promise.all(closePromises);
+    browserPool = [];
+    availableBrowsers.clear();
+    browserPoolLock.clear();
+  } catch (error) {
+    console.error("Error cleaning up browser pool:", error);
   }
 }
 
@@ -1237,6 +1397,15 @@ export async function crawl_website(
   contextType: ContextType | null = null,
   currentDepth: number = 0
 ) {
+  // Add performance monitoring
+  const startTime = Date.now();
+  const metrics = {
+    urlsProcessed: 0,
+    successfulUrls: 0,
+    failedUrls: 0,
+    totalTime: 0,
+  };
+
   try {
     // Handle X/Twitter posts first and return immediately
     if (base_url.includes("x.com") || base_url.includes("twitter.com")) {
@@ -1544,9 +1713,17 @@ export async function crawl_website(
       );
       return [];
     }
+
+    // Update metrics
+    metrics.totalTime = Date.now() - startTime;
+    console.log("Crawl metrics:", metrics);
+
+    return [];
   } catch (error) {
     console.error("Fatal error in crawl_website:", error);
-    return []; // Return empty array instead of crashing
+    metrics.totalTime = Date.now() - startTime;
+    console.log("Crawl metrics (with error):", metrics);
+    return [];
   }
 }
 
