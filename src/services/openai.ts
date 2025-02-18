@@ -1,7 +1,6 @@
 import openai from "../initalizers/openai";
 import pgvector from "pgvector";
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { PromptType } from "./conversation";
 
 // Add type for retry options
 interface RetryOptions {
@@ -14,6 +13,8 @@ export const MAX_TOKENS = 2000; // Significantly reduced from 4000
 export const TOKEN_OVERLAP = 25; // Reduced from 50
 export const MIN_CHUNK_LENGTH = 100;
 export const ABSOLUTE_MAX_TOKENS = 7000; // Reduced from 8000
+
+type PromptType = "general" | "agent";
 
 // Helper function to estimate tokens (rough approximation)
 export function estimateTokens(text: string): number {
@@ -359,8 +360,8 @@ function formatAddress(address: string, chain: string = "mainnet"): string {
     chain === "mainnet"
       ? `https://etherscan.io/address/${address}`
       : chain === "gnosis"
-      ? `https://gnosisscan.io/address/${address}`
-      : `https://basescan.org/address/${address}`;
+        ? `https://gnosisscan.io/address/${address}`
+        : `https://basescan.org/address/${address}`;
   return `[${abbreviated}](${explorerUrl})`;
 }
 
@@ -441,51 +442,6 @@ When providing agent implementation guidance:
 - I emphasize security best practices and potential pitfalls
 - I suggest testing strategies and validation approaches
 - I recommend ways to ensure agent reliability and efficiency`,
-
-    code: `I'm Andy, an Autonolas (Olas) development expert specializing in autonomous agent creation. I focus on practical implementation using auto_dev.
-
-Key Capabilities:
-- Agent flow design and visualization
-- FSM (Finite State Machine) creation
-- YAML configuration generation
-- Contract and component development
-- Service creation and deployment
-
-Development Process:
-1. Create FSM diagram for agent flow in YAML format. The name must end in AbciApp
-2. Generate workflow commands for implementation in YAML format
-
-${context}
-
-Implementation Guidelines:
-- Focus on security best practices
-- Provide complete, working code examples
-- Explain architectural decisions
-- Highlight potential issues and solutions
-
-I provide clear, actionable guidance while maintaining technical accuracy. Each response will include:
-1. Flow visualization (mermaid diagram). Requirements:
-   - The name must end in AbciApp
-   - Must be compatible with Jinja templating
-   - Use proper mermaid syntax for state diagrams
-2. convert the mermaid diagram to a fsm using adev fsm from-file *some-mermaid-file*.mmd *app-name-here* --in-type mermaid --output fsm_spec > *your-fsm-file*.yaml
-3. Step-by-step implementation commands within a YAML file to do a workflow in (provide the command also using adev wf, as part of this workflow include the adev fsm command to create the fsm from the fsm_spec file).
-  a. when creating an agent, use adev create_from_fsm author/agent *your-fsm-file*.yaml *agent-name-here*, this does the create, eject, augment and publish commands for us
-  b. you can put any command line command in a workflow file.
-4. Relevant code examples
-
-How I communicate:
-* I only use hyperlinks from my validated link list
-* when outputting code, I use markdown code blocks in the designated language i.e \`\`\`python or \`\`\`yaml
-* I never create or imagine links that aren't in my validated set
-* If I need to reference something without a valid link, I mention it without creating a link
-* I structure information in layers - basic explanation first, followed by validated linked resources
-* I chat naturally while keeping responses concise and focused
-* I get straight to answers without greetings
-* I'm direct about what I can and cannot help with
-* I break down complex topics into simpler terms
-* I only answer questions related to ${system_prompt_name}
-* I don't provide financial advice`,
   };
 
   let transactionContext = "";
@@ -585,71 +541,37 @@ export async function* generateChatResponseWithRetry(
   promptType: PromptType = "general",
   agent?: { name: string; description: string } | null,
   transactions?: any[]
-): AsyncGenerator<string> {
+) {
+  const contextString = formatContextForPrompt(context);
+
+  const validLinks = extractValidLinks(context, transactions);
+
+  const systemPrompt = createSystemPrompt(
+    contextString,
+    validLinks,
+    system_prompt_name,
+    promptType,
+    agent,
+    transactions
+  );
+
   try {
-    if (!promptType) {
-      promptType = "general";
-    }
-
-    // Find workflow example in context if it exists
-    console.log(
-      "Context locations:",
-      context.map((ctx) => ctx.location)
-    );
-    const workflowExample = context.find(
-      (ctx) =>
-        ctx.location.toLowerCase().includes("create_new_agent_from_fsm.yaml") ||
-        (ctx.name &&
-          ctx.name.toLowerCase().includes("create_new_agent_from_fsm.yaml"))
-    );
-
-    console.log("Found workflow:", workflowExample);
-
-    const workflowPrompt = workflowExample
-      ? `\nWhen discussing workflows or agent creation, here is the official workflow template:\n\n\`\`\`yaml\n${workflowExample.content}\n\`\`\`\n\nThis is the canonical example for creating new agents and defining workflows in the system.\n`
-      : "";
-    console.log("workflowPrompt", workflowPrompt);
-
-    const contextString = formatContextForPrompt(context);
-    const validLinks = extractValidLinks(context, transactions);
-
-    const systemPrompt = createSystemPrompt(
-      contextString + workflowPrompt,
-      validLinks,
-      system_prompt_name,
-      promptType,
-      agent,
-      transactions
-    );
-    console.log("systemPrompt", systemPrompt);
-
-    const model = promptType === "code" ? "o3-mini" : "gpt-4o-mini";
-
-    const stream = await openai.chat.completions.create({
-      model,
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
       messages: [systemPrompt, ...messages],
-      ...(promptType === "code" ? { store: true } : {}),
+      temperature: 0.7,
+      max_tokens: 1250,
       stream: true,
-      ...(promptType === "code" ? { reasoning_effort: "medium" } : {}),
     });
 
-    for await (const part of stream) {
-      try {
-        const content = part.choices[0]?.delta?.content;
-        if (content) {
-          yield content;
-        }
-      } catch (streamError) {
-        console.error("Error processing stream chunk:", streamError);
-        continue;
+    for await (const chunk of response as any) {
+      const content = chunk.choices[0]?.delta?.content;
+      if (content) {
+        yield content;
       }
     }
   } catch (error) {
     console.error("Streaming error:", error);
-    if (error instanceof Error) {
-      yield `Error: ${error.message}`;
-    } else {
-      yield "An unknown error occurred";
-    }
+    throw error;
   }
 }
